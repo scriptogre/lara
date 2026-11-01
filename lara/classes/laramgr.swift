@@ -238,22 +238,24 @@ final class laramgr: ObservableObject {
             return
         }
 
-        var removed = 0
+        var removedFiles = 0
+        var removedDirectories = 0
         var errors: [String] = []
         do {
             for url in try manager.contentsOfDirectory(at: URL(fileURLWithPath: target), includingPropertiesForKeys: nil) {
-                do {
-                    try manager.removeItem(at: url)
-                    removed += 1
-                    if removed % 25 == 0 {
-                        writeCacheResult(["status": "running", "deleted": false, "removedTopLevelEntries": removed, "before": before], operation: "cleanup", finished: false)
-                    }
-                } catch {
-                    errors.append("\(url.path): \(error.localizedDescription)")
+                removeCacheItem(at: url, removedFiles: &removedFiles, removedDirectories: &removedDirectories, errors: &errors)
+                if removedDirectories % 25 == 0 {
+                    writeCacheResult([
+                        "status": "running",
+                        "deleted": false,
+                        "removedFiles": removedFiles,
+                        "removedDirectories": removedDirectories,
+                        "before": before,
+                    ], operation: "cleanup", finished: false)
                 }
             }
         } catch {
-            errors.append("\(target): \(error.localizedDescription)")
+            errors.append("list errno=\(errno) path=\(target): \(error.localizedDescription)")
         }
         sync()
 
@@ -262,12 +264,51 @@ final class laramgr: ObservableObject {
         writeCacheResult([
             "status": complete ? "complete" : "partial",
             "deleted": complete,
-            "removedTopLevelEntries": removed,
+            "removedFiles": removedFiles,
+            "removedDirectories": removedDirectories,
             "deleteErrors": Array(errors.prefix(100)),
             "deleteErrorCount": errors.count,
             "before": before,
             "after": after,
         ], operation: "cleanup")
+    }
+
+    private func removeCacheItem(at url: URL, removedFiles: inout Int, removedDirectories: inout Int, errors: inout [String]) {
+        var status = Darwin.stat()
+        let path = url.path
+        guard lstat(path, &status) == 0 else {
+            errors.append("lstat errno=\(errno) path=\(path)")
+            return
+        }
+
+        let mode = status.st_mode
+        let flags = status.st_flags
+        let isDirectory = (mode & S_IFMT) == S_IFDIR
+        if flags != 0, chflags(path, 0) != 0, errors.count < 100 {
+            errors.append("chflags errno=\(errno) flags=0x\(String(flags, radix: 16)) mode=0\(String(mode, radix: 8)) uid=\(status.st_uid) gid=\(status.st_gid) path=\(path)")
+        }
+        if chmod(path, isDirectory ? 0o700 : 0o600) != 0, errors.count < 100 {
+            errors.append("chmod errno=\(errno) flags=0x\(String(flags, radix: 16)) mode=0\(String(mode, radix: 8)) uid=\(status.st_uid) gid=\(status.st_gid) path=\(path)")
+        }
+
+        if isDirectory {
+            do {
+                for child in try FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: nil) {
+                    removeCacheItem(at: child, removedFiles: &removedFiles, removedDirectories: &removedDirectories, errors: &errors)
+                }
+            } catch {
+                if errors.count < 100 { errors.append("list errno=\(errno) path=\(path): \(error.localizedDescription)") }
+            }
+            if rmdir(path) == 0 {
+                removedDirectories += 1
+            } else if errors.count < 100 {
+                errors.append("rmdir errno=\(errno) flags=0x\(String(flags, radix: 16)) mode=0\(String(mode, radix: 8)) uid=\(status.st_uid) gid=\(status.st_gid) path=\(path)")
+            }
+        } else if unlink(path) == 0 {
+            removedFiles += 1
+        } else if errors.count < 100 {
+            errors.append("unlink errno=\(errno) flags=0x\(String(flags, radix: 16)) mode=0\(String(mode, radix: 8)) uid=\(status.st_uid) gid=\(status.st_gid) path=\(path)")
+        }
     }
 
     private func writeCacheResult(_ values: [String: Any], operation: String, finished: Bool = true) {
