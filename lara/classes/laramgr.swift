@@ -132,101 +132,161 @@ final class laramgr: ObservableObject {
 
     func runCacheDiagnosticIfRequested() {
         let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        let request = documents.appendingPathComponent("cache-diagnostic.request")
-        let running = documents.appendingPathComponent("cache-diagnostic.running")
+        let cleanupRequest = documents.appendingPathComponent("cache-cleanup.request")
+        let diagnosticRequest = documents.appendingPathComponent("cache-diagnostic.request")
+        let cleanup = FileManager.default.fileExists(atPath: cleanupRequest.path)
+        let request = cleanup ? cleanupRequest : diagnosticRequest
         guard FileManager.default.fileExists(atPath: request.path) else { return }
 
+        if cleanup {
+            let approval = (try? String(contentsOf: request, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard approval == "DELETE DISCARDED CACHE" else {
+                writeCacheResult(["status": "approval-error", "deleted": false], operation: "cleanup")
+                return
+            }
+        }
+
+        let running = documents.appendingPathComponent(cleanup ? "cache-cleanup.running" : "cache-diagnostic.running")
         do {
             if FileManager.default.fileExists(atPath: running.path) {
                 try FileManager.default.removeItem(at: running)
             }
             try FileManager.default.moveItem(at: request, to: running)
         } catch {
-            writeCacheDiagnosticResult(status: "request-error", error: error.localizedDescription)
+            writeCacheResult(["status": "request-error", "error": error.localizedDescription, "deleted": false], operation: cleanup ? "cleanup" : "diagnostic")
             return
         }
 
         run { success in
             guard success else {
-                self.writeCacheDiagnosticResult(status: "exploit-failed")
+                self.writeCacheResult(["status": "exploit-failed", "deleted": false], operation: cleanup ? "cleanup" : "diagnostic")
                 return
             }
             self.sbxescape { escaped in
                 guard escaped else {
-                    self.writeCacheDiagnosticResult(status: "sandbox-failed")
+                    self.writeCacheResult(["status": "sandbox-failed", "deleted": false], operation: cleanup ? "cleanup" : "diagnostic")
                     return
                 }
                 DispatchQueue.global(qos: .userInitiated).async {
-                    self.writeCacheDiagnosticResult(status: "complete")
+                    if cleanup {
+                        self.deleteDiscardedCacheContents()
+                    } else {
+                        var report = self.cacheSnapshot()
+                        report["status"] = "complete"
+                        report["deleted"] = false
+                        self.writeCacheResult(report, operation: "diagnostic")
+                    }
                 }
             }
         }
     }
 
-    private func writeCacheDiagnosticResult(status: String, error: String? = nil) {
+    private func cacheSnapshot() -> [String: Any] {
         let target = "/private/var/mobile/Library/Caches/com.apple.cache_delete/com.apple.CacheDeleteAppContainerCaches.discardedCaches"
-        var report: [String: Any] = [
-            "status": status,
-            "target": target,
-            "generatedAt": ISO8601DateFormatter().string(from: Date()),
-            "deleted": false,
-        ]
-        if let error { report["error"] = error }
-
-        if status == "complete" {
-            let manager = FileManager.default
-            var isDirectory = ObjCBool(false)
-            let exists = manager.fileExists(atPath: target, isDirectory: &isDirectory)
-            report["exists"] = exists
-            report["isDirectory"] = isDirectory.boolValue
-
-            var files = 0
-            var directories = 0
-            var logicalBytes: Int64 = 0
-            var allocatedBytes: Int64 = 0
-            var errors: [String] = []
-            if exists, let enumerator = manager.enumerator(
-                at: URL(fileURLWithPath: target),
-                includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey, .fileSizeKey, .fileAllocatedSizeKey],
-                options: [],
-                errorHandler: { url, enumerationError in
-                    errors.append("\(url.path): \(enumerationError.localizedDescription)")
-                    return true
-                }
-            ) {
-                for case let url as URL in enumerator {
-                    do {
-                        let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isDirectoryKey, .fileSizeKey, .fileAllocatedSizeKey])
-                        if values.isDirectory == true { directories += 1 }
-                        if values.isRegularFile == true {
-                            files += 1
-                            logicalBytes += Int64(values.fileSize ?? 0)
-                            allocatedBytes += Int64(values.fileAllocatedSize ?? values.fileSize ?? 0)
-                        }
-                    } catch {
-                        errors.append("\(url.path): \(error.localizedDescription)")
+        let manager = FileManager.default
+        var isDirectory = ObjCBool(false)
+        let exists = manager.fileExists(atPath: target, isDirectory: &isDirectory)
+        var files = 0
+        var directories = 0
+        var logicalBytes: Int64 = 0
+        var allocatedBytes: Int64 = 0
+        var errors: [String] = []
+        if exists, let enumerator = manager.enumerator(
+            at: URL(fileURLWithPath: target),
+            includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey, .fileSizeKey, .fileAllocatedSizeKey],
+            options: [],
+            errorHandler: { url, enumerationError in
+                errors.append("\(url.path): \(enumerationError.localizedDescription)")
+                return true
+            }
+        ) {
+            for case let url as URL in enumerator {
+                do {
+                    let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isDirectoryKey, .fileSizeKey, .fileAllocatedSizeKey])
+                    if values.isDirectory == true { directories += 1 }
+                    if values.isRegularFile == true {
+                        files += 1
+                        logicalBytes += Int64(values.fileSize ?? 0)
+                        allocatedBytes += Int64(values.fileAllocatedSize ?? values.fileSize ?? 0)
                     }
+                } catch {
+                    errors.append("\(url.path): \(error.localizedDescription)")
                 }
             }
-            report["files"] = files
-            report["directories"] = directories
-            report["logicalBytes"] = logicalBytes
-            report["allocatedBytes"] = allocatedBytes
-            report["errors"] = Array(errors.prefix(100))
-            report["errorCount"] = errors.count
+        }
+        return [
+            "target": target,
+            "exists": exists,
+            "isDirectory": isDirectory.boolValue,
+            "files": files,
+            "directories": directories,
+            "logicalBytes": logicalBytes,
+            "allocatedBytes": allocatedBytes,
+            "errors": Array(errors.prefix(100)),
+            "errorCount": errors.count,
+        ]
+    }
+
+    private func deleteDiscardedCacheContents() {
+        let target = "/private/var/mobile/Library/Caches/com.apple.cache_delete/com.apple.CacheDeleteAppContainerCaches.discardedCaches"
+        let manager = FileManager.default
+        let before = cacheSnapshot()
+        guard before["exists"] as? Bool == true,
+              before["isDirectory"] as? Bool == true,
+              before["errorCount"] as? Int == 0 else {
+            writeCacheResult(["status": "preflight-failed", "deleted": false, "before": before], operation: "cleanup")
+            return
         }
 
+        var removed = 0
+        var errors: [String] = []
+        do {
+            for url in try manager.contentsOfDirectory(at: URL(fileURLWithPath: target), includingPropertiesForKeys: nil) {
+                do {
+                    try manager.removeItem(at: url)
+                    removed += 1
+                    if removed % 25 == 0 {
+                        writeCacheResult(["status": "running", "deleted": false, "removedTopLevelEntries": removed, "before": before], operation: "cleanup", finished: false)
+                    }
+                } catch {
+                    errors.append("\(url.path): \(error.localizedDescription)")
+                }
+            }
+        } catch {
+            errors.append("\(target): \(error.localizedDescription)")
+        }
+        sync()
+
+        let after = cacheSnapshot()
+        let complete = errors.isEmpty && (after["files"] as? Int == 0) && (after["directories"] as? Int == 0)
+        writeCacheResult([
+            "status": complete ? "complete" : "partial",
+            "deleted": complete,
+            "removedTopLevelEntries": removed,
+            "deleteErrors": Array(errors.prefix(100)),
+            "deleteErrorCount": errors.count,
+            "before": before,
+            "after": after,
+        ], operation: "cleanup")
+    }
+
+    private func writeCacheResult(_ values: [String: Any], operation: String, finished: Bool = true) {
+        var report = values
+        report["generatedAt"] = ISO8601DateFormatter().string(from: Date())
         do {
             let data = try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
             let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-            try data.write(to: documents.appendingPathComponent("cache-diagnostic.json"), options: .atomic)
-            let running = documents.appendingPathComponent("cache-diagnostic.running")
-            if FileManager.default.fileExists(atPath: running.path) {
-                try FileManager.default.removeItem(at: running)
+            try data.write(to: documents.appendingPathComponent("cache-\(operation).json"), options: .atomic)
+            if finished {
+                let running = documents.appendingPathComponent("cache-\(operation).running")
+                if FileManager.default.fileExists(atPath: running.path) {
+                    try FileManager.default.removeItem(at: running)
+                }
             }
-            logmsg("cache diagnostic: \(status)")
+            let status = report["status"] ?? "unknown"
+            logmsg("cache \(operation): \(status)")
         } catch {
-            logmsg("cache diagnostic write failed: \(error.localizedDescription)")
+            logmsg("cache \(operation) report failed: \(error.localizedDescription)")
         }
     }
     
