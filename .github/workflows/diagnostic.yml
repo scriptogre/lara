@@ -1,6 +1,8 @@
 name: diagnostic
 
 on:
+  push:
+    branches: [diagnostic/cache-report]
   workflow_dispatch:
 
 jobs:
